@@ -90,6 +90,64 @@ def _libredwg_version():
         return "installed"
 
 
+def _sanitize_dxf_handles(path):
+    """Reassign invalid '0' object-handles (a known LibreDWG dwg2dxf artifact) so
+    ezdxf can load the file. Returns the number of handles repaired."""
+    try:
+        lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
+    except Exception:  # noqa: BLE001
+        return 0
+    existing = set()
+    for i in range(len(lines) - 1):
+        if lines[i].strip() in ("5", "105"):
+            try:
+                existing.add(int(lines[i + 1].strip(), 16))
+            except ValueError:
+                pass
+    nxt = (max(existing) if existing else 0) + 1
+    changed = 0
+    for i in range(len(lines) - 1):
+        if lines[i].strip() in ("5", "105") and lines[i + 1].strip() == "0":
+            lines[i + 1] = format(nxt, "X")
+            nxt += 1
+            changed += 1
+    if changed:
+        open(path, "w", encoding="utf-8").write("\n".join(lines))
+    return changed
+
+
+def _prepare_base(local_path, workdir):
+    """Normalise the base drawing to a DXF the pipeline can always read.
+
+    Native AutoCAD .dwg is converted via LibreDWG (dwg2dxf); the output (and any
+    .dxf input) then has invalid '0' handles repaired so ezdxf never chokes.
+    Returns (dxf_path, ingest_note).
+    """
+    if not isinstance(local_path, str):
+        raise RuntimeError("no base drawing provided")
+    low = local_path.lower()
+    if low.endswith(".dwg"):
+        exe = shutil.which("dwg2dxf")
+        if not exe:
+            raise RuntimeError(
+                "DWG input requires LibreDWG (dwg2dxf), which is not installed in this image"
+            )
+        raw = os.path.join(workdir, "_base_from_dwg.dxf")
+        cp = subprocess.run(
+            [exe, "-y", "-o", raw, local_path], capture_output=True, text=True, timeout=600
+        )
+        if not (os.path.exists(raw) and os.path.getsize(raw) > 1000):
+            tail = ((cp.stderr or "") + (cp.stdout or ""))[-300:]
+            raise RuntimeError(f"dwg2dxf could not convert the DWG: {tail}")
+        fixed = _sanitize_dxf_handles(raw)
+        return raw, f"converted DWG->DXF via LibreDWG (handles repaired: {fixed})"
+    if low.endswith(".dxf"):
+        fixed = _sanitize_dxf_handles(local_path)
+        note = "ingested DXF directly" if not fixed else f"ingested DXF (handles repaired: {fixed})"
+        return local_path, note
+    return local_path, "ingested as-is"
+
+
 @app.get("/health")
 def health():
     import ezdxf
@@ -157,6 +215,12 @@ def run():
     except Exception as e:  # noqa: BLE001
         return jsonify({"error": f"could not read base_file: {e}"}), 400
 
+    # Convert DWG -> DXF (LibreDWG) and repair handles so ezdxf always loads it.
+    try:
+        local_base, ingest_note = _prepare_base(local_base, workdir)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"could not prepare base drawing: {e}"}), 400
+
     try:
         result = fire_protection_pipeline(
             base_file=local_base,
@@ -188,6 +252,8 @@ def run():
         if path and os.path.isfile(path):
             artifacts[key] = f"{PUBLIC_BASE_URL}/artifact/{sheet}/{os.path.basename(path)}"
     result["artifacts"] = artifacts
+    if isinstance(result.get("snapshot"), dict):
+        result["snapshot"]["ingest"] = ingest_note
     result.pop("outputs", None)  # drop absolute container paths from the response
     result.pop("log", None)
     return jsonify(result)
