@@ -154,21 +154,41 @@ def _strip_sortentstables(path):
 
 
 def _normalize_dxf(path):
-    """Guarantee the DXF is loadable by a plain ezdxf.readfile() downstream. If the
-    converter output still trips strict loading, fall back to ezdxf.recover (the
-    tolerant byte-level loader) and re-emit a clean DXF in place. Returns a note."""
+    """Load the converter output (tolerantly if needed) and re-emit it through ezdxf
+    so the downstream doc is internally consistent for BOTH parsing and rendering.
+    A plain strip can leave dangling draw-order/handle references that load fine but
+    crash the matplotlib backend's entity reorder ('dictionary update sequence ...');
+    a full ezdxf round-trip rebuilds a clean handle space and drops those. Returns a note."""
     import ezdxf
 
     try:
-        ezdxf.readfile(path)
-        return "clean"
+        doc = ezdxf.readfile(path)
+        note = "clean"
+    except Exception:  # noqa: BLE001
+        from ezdxf import recover
+
+        doc, auditor = recover.readfile(path)
+        note = f"recovered via ezdxf.recover ({len(auditor.errors)} issues)"
+    # Clear malformed draw-order refs and rebuild the materials table. Real DWGs
+    # convert with (a) single-handle ACAD_SORTENTS tables that crash the render
+    # backend's entity reorder, and (b) a dangling 'ByLayer' material that crashes
+    # ezdxf's writer. Drop both so the clean re-emit always succeeds and renders.
+    try:
+        for layout in list(doc.layouts):
+            br = layout.block_record
+            if br.has_extension_dict:
+                xd = br.get_extension_dict()
+                if xd and "ACAD_SORTENTS" in xd:
+                    xd.discard("ACAD_SORTENTS")
     except Exception:  # noqa: BLE001
         pass
-    from ezdxf import recover
-
-    doc, auditor = recover.readfile(path)
-    doc.saveas(path)  # re-emit a guaranteed-loadable DXF
-    return f"recovered via ezdxf.recover ({len(auditor.errors)} issues)"
+    try:
+        doc.materials.clear()
+        doc.materials.create_required_entries()
+    except Exception:  # noqa: BLE001
+        pass
+    doc.saveas(path)
+    return note
 
 
 def _prepare_base(local_path, workdir):
