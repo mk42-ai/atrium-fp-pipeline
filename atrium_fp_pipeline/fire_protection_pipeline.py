@@ -48,8 +48,8 @@ def _pipe_size_mm(n):
 
 def _zone_layout(msp, place, zones, default_spacing_mm, HZ):
     """Agent-defined zones -> NFPA coverage-grid sprinklers + routed branch/cross-main
-    pipework with per-segment pipe-size (Ø) labels. Returns (rows, sprk)."""
-    rows=[]; sprk=[]
+    pipework with per-segment pipe-size (Ø) labels. Returns (rows, sprk, feeds)."""
+    rows=[]; sprk=[]; feeds=[]
     def _lab(x,y,s):
         t=msp.add_text("Ø%d"%s,dxfattribs={"layer":"FP-TEXT","height":160,"color":4}); t.set_placement((x,y))
     def _frange(a,b,step):
@@ -98,9 +98,10 @@ def _zone_layout(msp, place, zones, default_spacing_mm, HZ):
             for idx in range(len(ys)-1,0,-1):
                 cum+=row_heads[ys[idx]]
                 _lab(feedx-S*0.3,(ys[idx]+ys[idx-1])/2.0,_pipe_size_mm(cum))
-            cum+=row_heads[ys[0]]
-            _lab(feedx-S*0.3,ys[0]-S*0.25,_pipe_size_mm(cum))
-    return rows, sprk
+            total=cum+row_heads[ys[0]]
+            _lab(feedx-S*0.3,ys[0]-S*0.25,_pipe_size_mm(total))
+            feeds.append((feedx,ys[0],total,zname))
+    return rows, sprk, feeds
 
 def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj=None, units=None,
                              scale=None, containment_tolerance_mm=None, output_formats=None,
@@ -147,6 +148,7 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
     mk("FP_LV",lambda b:(b.add_lwpolyline([(-180,-180),(180,180)]),b.add_lwpolyline([(-180,180),(180,-180)]),b.add_circle((0,0),200)))
     mk("FP_HR",lambda b:(b.add_circle((0,0),300),b.add_circle((0,0),90)))
     mk("FP_RISER",lambda b:(b.add_circle((0,0),250),b.add_text("R",dxfattribs={"height":220}).set_placement((-90,-110))))
+    mk("FP_FHC",lambda b:(b.add_lwpolyline([(-250,-300),(250,-300),(250,300),(-250,300),(-250,-300)]),b.add_lwpolyline([(-130,-160),(130,-160),(130,160),(-130,160),(-130,-160)]),b.add_text("FHC",dxfattribs={"height":140}).set_placement((-130,-470))))
 
     def place(block,x,y,layer,tag,model,hz):
         r=msp.add_blockref(block,(x,y),dxfattribs={"layer":layer})
@@ -156,10 +158,12 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
     rows=[]; sprk=[]
     if zones or devices:
         # ---- Agent-defined ZONES -> coverage-grid sprinklers + sized routed pipework ----
+        feeds=[]
         if zones:
-            zr,zs=_zone_layout(msp,place,zones,nfpa['nfpa13'].get('max_spacing_m',4.6)*1000.0,HZ)
+            zr,zs,feeds=_zone_layout(msp,place,zones,nfpa['nfpa13'].get('max_spacing_m',4.6)*1000.0,HZ)
             rows+=zr; sprk+=zs
-        # ---- Explicit devices: extras (detectors, riser, ZCV, ...) the agent places exactly ----
+        # ---- Explicit devices: riser, ZCV, detectors, hose reels, FHCs, wall openings, ... ----
+        riser_xy=None
         if devices:
             PLACE_MAP=OrderedDict([
                 ("sprinkler",("FP_SPK","FP-SPRINKLER-HEAD","ESFR K-25.2","SPK","ESFR K-25.2 sprinkler")),
@@ -170,6 +174,7 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
                 ("zcv",("FP_ZCV","FP-ZCV","BFV+FS+T&D","ZCV","Zone Control Valve")),
                 ("landing_valve",("FP_LV","FP-LANDINGVALVE","Landing Valve DN65","LV","Landing Valve")),
                 ("hose_reel",("FP_HR","FP-HOSEREEL","Hose Reel 30m DN25","HR","Hose Reel")),
+                ("fhc",("FP_FHC","FP-HOSEREEL","Fire Hose Cabinet","FHC","Fire Hose Cabinet")),
                 ("riser",("FP_RISER","FP-RISER","Wet Riser DN150","WR","Wet Riser"))])
             ALIAS={"sprinkler_head":"sprinkler","spk":"sprinkler","sprinklerhead":"sprinkler",
                    "smoke_detector":"smoke","smoke_det":"smoke","sd":"smoke","photoelectric":"smoke",
@@ -179,15 +184,45 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
                    "zone_control_valve":"zcv","zonecontrolvalve":"zcv",
                    "landingvalve":"landing_valve","lv":"landing_valve",
                    "hosereel":"hose_reel","hr":"hose_reel",
-                   "wet_riser":"riser","wetriser":"riser","standpipe":"riser","wr":"riser"}
+                   "fire_hose_cabinet":"fhc","hose_cabinet":"fhc","cabinet":"fhc",
+                   "wet_riser":"riser","wetriser":"riser","standpipe":"riser","wr":"riser",
+                   "opening":"wall_opening","ope":"wall_opening","penetration":"wall_opening"}
+            def _txt(s,x,y,h=200,color=1):
+                tt=msp.add_text(str(s),dxfattribs={"layer":"FP-TEXT","height":h,"color":color}); tt.set_placement((x,y))
             for dev in devices:
                 t=str(dev.get("type","")).strip().lower().replace("-","_").replace(" ","_"); t=ALIAS.get(t,t)
-                if t not in PLACE_MAP or "x" not in dev or "y" not in dev: continue
-                blk,layer,defmodel,pfx,tname=PLACE_MAP[t]; x=float(dev["x"]); y=float(dev["y"])
-                tag=str(dev.get("tag") or f"{pfx}-{sum(1 for r in rows if r[6]==layer)+1:02d}")
+                if "x" not in dev or "y" not in dev: continue
+                x=float(dev["x"]); y=float(dev["y"])
+                if t=="wall_opening":
+                    w=float(dev.get("w",1000)); hh=float(dev.get("h",1670))
+                    msp.add_lwpolyline([(x-w/2,y-hh/2),(x+w/2,y-hh/2),(x+w/2,y+hh/2),(x-w/2,y+hh/2),(x-w/2,y-hh/2)],close=True,dxfattribs={"layer":"FP-TITLEBLOCK"})
+                    _txt(dev.get("label") or "%d(H)x%d(L) WALL OPENING"%(int(hh),int(w)),x+w/2+200,y,h=180)
+                    rows.append([str(dev.get("tag") or "OPE"),"Wall Opening","%.1f"%x,"%.1f"%y,str(dev.get("room") or "wall"),HZ,"FP-TITLEBLOCK"]); continue
+                if t not in PLACE_MAP: continue
+                blk,layer,defmodel,pfx,tname=PLACE_MAP[t]
+                tag=str(dev.get("tag") or "%s-%02d"%(pfx,sum(1 for r in rows if r[6]==layer)+1))
                 place(blk,x,y,layer,tag,str(dev.get("model") or defmodel),HZ)
-                rows.append([tag,tname,f"{x:.1f}",f"{y:.1f}",str(dev.get("room") or "agent-placed"),HZ,layer])
+                rows.append([tag,tname,"%.1f"%x,"%.1f"%y,str(dev.get("room") or "agent-placed"),HZ,layer])
                 if t=="sprinkler": sprk.append((x,y))
+                elif t=="riser":
+                    riser_xy=(x,y); sched=dev.get("schedule")
+                    if sched:
+                        ly=y-450
+                        for line in (sched if isinstance(sched,(list,tuple)) else [sched]):
+                            _txt(line,x+450,ly,h=180,color=7); ly-=320
+                elif t=="zcv":
+                    _txt("Ø%s ZCV"%dev.get("size",65),x+450,y+120,h=200)
+                elif t in ("landing_valve","hose_reel"):
+                    cov=dev.get("coverage_m")
+                    if cov:
+                        rr=float(cov)*1000.0
+                        msp.add_lwpolyline([(x+rr*math.cos(a),y+rr*math.sin(a)) for a in [i*math.pi/24 for i in range(48)]],close=True,dxfattribs={"layer":"FP-COVERAGE-HATCH"})
+                        _txt("%sm"%cov,x+rr*0.62,y+rr*0.62,h=300)
+        # ---- Mains: connect each zone's cross-main feed to the riser, sized by zone demand ----
+        if zones and riser_xy and feeds:
+            for (fx,fy,heads,zn) in feeds:
+                msp.add_lwpolyline([(fx,fy),(fx,riser_xy[1]),(riser_xy[0],riser_xy[1])],dxfattribs={"layer":"FP-PIPE-CROSSMAIN"})
+                _ml=msp.add_text("Ø%d"%_pipe_size_mm(heads),dxfattribs={"layer":"FP-TEXT","height":220,"color":1}); _ml.set_placement(((fx+riser_xy[0])/2.0,riser_xy[1]+160))
         # Auto-wire explicit-only sprinklers (zones bring their own routing)
         if devices and not zones and sprk:
             cy0=sum(s[1] for s in sprk)/len(sprk); xmn=min(s[0] for s in sprk); xmx=max(s[0] for s in sprk)
@@ -233,10 +268,11 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
         log.append((f"placed {len(rows)} devices",_utc()))
 
     cover_r=nfpa['nfpa13'].get('max_spacing_m',4.6)*500.0; hatches=[]
-    for (x,y) in sprk:
-        h=msp.add_hatch(color=8,dxfattribs={"layer":"FP-COVERAGE-HATCH"})
-        h.paths.add_polyline_path([(x+cover_r*math.cos(a),y+cover_r*math.sin(a)) for a in [i*math.pi/16 for i in range(32)]],is_closed=True)
-        h.set_solid_fill(color=8); h.transparency=0.70; hatches.append(h)
+    if not (zones or devices):  # filled coverage blobs clutter agent-designed / routed layouts
+        for (x,y) in sprk:
+            h=msp.add_hatch(color=8,dxfattribs={"layer":"FP-COVERAGE-HATCH"})
+            h.paths.add_polyline_path([(x+cover_r*math.cos(a),y+cover_r*math.sin(a)) for a in [i*math.pi/16 for i in range(32)]],is_closed=True)
+            h.set_solid_fill(color=8); h.transparency=0.70; hatches.append(h)
 
     TYPEMAP=OrderedDict([("FP-SPRINKLER-HEAD",("Sprinkler Head (ESFR)","ESFR K-25.2")),
      ("FP-DET-SMOKE",("Smoke Detector","Addr. Photoelectric")),("FP-DET-HEAT",("Heat Detector","Addr. Fixed/RoR 57C")),
