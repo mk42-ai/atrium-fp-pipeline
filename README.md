@@ -39,12 +39,18 @@ base snapshot JSON).
 ## Layout
 
 ```
-Dockerfile             python:3.11-slim + LibreDWG (optional) + deps
-requirements.txt       ezdxf==1.4.4, matplotlib==3.11.0, Flask
-server.py              Flask wrapper (/health, /run, /artifact)
+Dockerfile             multi-stage: builds LibreDWG (dwg2dxf) from source + python runtime (gunicorn)
+requirements.txt       ezdxf==1.4.2, matplotlib==3.9.4, Flask, gunicorn
+server.py              Flask app (/health, /run, /artifact) served by gunicorn
 openapi-schema.json    OpenAPI 3.0 spec (used by the On Demand plugin)
 atrium_fp_pipeline/    the pipeline package (fire_protection_pipeline)
 ```
+
+**Native DWG ingest:** AutoCAD `.dwg` drawings are converted in-container via
+LibreDWG (`dwg2dxf`), compiled from source in the build stage (it is not in
+Debian apt). `.dxf` is ingested directly. `base_file` accepts a URL; or pass the
+drawing bytes as `base_file_base64` (+ `base_file_name`). `/health` reports the
+LibreDWG version under `libredwg`.
 
 ## Run locally
 

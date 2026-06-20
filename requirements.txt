@@ -1,5 +1,7 @@
 # Spec pinned ezdxf 1.4.4 / matplotlib 3.11.0, but those releases are not on PyPI.
-# Pinned to the latest installable versions (stable ezdxf 1.4.x + matplotlib 3.9.x).
+# Pinned to the latest installable versions (stable ezdxf 1.4.x + matplotlib 3.9.x),
+# verified to install + run the full pipeline (DXF/PDF/PNG render) in this image.
 ezdxf==1.4.2
 matplotlib==3.9.4
 Flask==3.0.3
+gunicorn==23.0.0

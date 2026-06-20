@@ -2,8 +2,9 @@
 """
 atrium-fp-pipeline — serverless HTTP wrapper (On Demand serverless app).
 
-Runs the self-contained fire_protection_pipeline IN-container (ezdxf 1.4.4 +
+Runs the self-contained fire_protection_pipeline IN-container (ezdxf +
 matplotlib, headless Agg) and serves the generated artifacts over HTTP.
+Native AutoCAD .dwg drawings are ingested via LibreDWG (dwg2dxf); .dxf is direct.
 
 Routes:
   GET  /health                       -> service + engine status
@@ -15,8 +16,10 @@ Routes:
 
 No API keys or credentials required — the pipeline is fully local.
 """
+import base64
 import os
 import shutil
+import subprocess
 import traceback
 from urllib.parse import urlparse, unquote
 from urllib.request import urlopen, Request
@@ -31,7 +34,7 @@ from atrium_fp_pipeline import (
 )
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB request cap
+app.config["MAX_CONTENT_LENGTH"] = 128 * 1024 * 1024  # 128 MB (base64 of a large drawing)
 
 # Where pipeline runs write their artifacts (served back via /artifact).
 OUT_ROOT = os.environ.get("OUT_ROOT", "/tmp/atrium_out")
@@ -71,6 +74,22 @@ def _download(url, dest_dir):
     return dest
 
 
+def _libredwg_version():
+    """Return the LibreDWG version string, or None if dwg2dxf isn't installed."""
+    exe = shutil.which("dwg2dxf")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10)
+        text = ((out.stdout or "") + " " + (out.stderr or "")).replace(",", " ")
+        for tok in text.split():
+            if tok[:1].isdigit() and "." in tok:
+                return tok
+        return "installed"
+    except Exception:  # noqa: BLE001
+        return "installed"
+
+
 @app.get("/health")
 def health():
     import ezdxf
@@ -87,6 +106,8 @@ def health():
                 "matplotlib": matplotlib.__version__,
             },
             "dwg2dxf": bool(shutil.which("dwg2dxf")),
+            "libredwg": _libredwg_version(),
+            "dwg_supported": bool(shutil.which("dwg2dxf")),
         }
     )
 
@@ -95,10 +116,16 @@ def health():
 def run():
     body = request.get_json(force=True, silent=True) or {}
     base_file = body.get("base_file")
+    base_b64 = body.get("base_file_base64")
     sheet = body.get("floor_sheet_id")
-    if not base_file or not sheet:
+    if not sheet or not (base_file or base_b64):
         return (
-            jsonify({"error": "base_file and floor_sheet_id are required"}),
+            jsonify(
+                {
+                    "error": "floor_sheet_id and one of base_file (URL to .dxf/.dwg) "
+                    "or base_file_base64 are required"
+                }
+            ),
             400,
         )
 
@@ -107,16 +134,28 @@ def run():
     shutil.rmtree(workdir, ignore_errors=True)
     os.makedirs(workdir, exist_ok=True)
 
-    # Resolve base_file: URL -> download into workdir; else treat as a local path.
+    # Resolve the base drawing into workdir:
+    #   base_file_base64 -> decode bytes; base_file URL -> download; else local path.
     try:
-        if isinstance(base_file, str) and base_file.lower().startswith(
+        if base_b64:
+            if base_b64.lstrip().startswith("data:") and "," in base_b64:
+                base_b64 = base_b64.split(",", 1)[1]
+            data = base64.b64decode(base_b64)
+            if len(data) < 64:
+                raise ValueError("base_file_base64 decoded to too few bytes")
+            local_base = os.path.join(
+                workdir, _safe_basename(body.get("base_file_name") or "base.dxf")
+            )
+            with open(local_base, "wb") as f:
+                f.write(data)
+        elif isinstance(base_file, str) and base_file.lower().startswith(
             ("http://", "https://")
         ):
             local_base = _download(base_file, workdir)
         else:
             local_base = base_file
     except Exception as e:  # noqa: BLE001
-        return jsonify({"error": f"could not fetch base_file: {e}"}), 400
+        return jsonify({"error": f"could not read base_file: {e}"}), 400
 
     try:
         result = fire_protection_pipeline(

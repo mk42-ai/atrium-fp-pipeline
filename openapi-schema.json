@@ -3,7 +3,7 @@
   "info": {
     "title": "Atrium FP Pipeline API",
     "version": "1.0.0",
-    "description": "Reusable Atrium Tower fire-protection CAD pipeline (ezdxf 1.4.4 + matplotlib). Given a base architectural drawing (DXF preferred, or DWG) by public URL and a floor sheet ID, it produces an architecture-preserving NFPA fire-protection overlay (devices, routing, coverage hatch, legend, auto schedule, title block), runs a 3-gate self-verification (G1 architecture untouched, G2 device-in-room containment, G3 within drawing extents), and exports print-ready DXF + PDF + PNG plus a per-device traceability CSV and verification MD/JSON. Returns the verification verdict, the auto device schedule, the device total, and downloadable URLs for all artifacts."
+    "description": "Reusable Atrium Tower fire-protection CAD pipeline (ezdxf + matplotlib, with native AutoCAD DWG ingest via LibreDWG). Given a base architectural drawing — a native AutoCAD .dwg or a .dxf, provided by public URL or base64 — and a floor sheet ID, it produces an architecture-preserving NFPA fire-protection overlay (devices, routing, coverage hatch, legend, auto schedule, title block), runs a 3-gate self-verification (G1 architecture untouched, G2 device-in-room containment, G3 within drawing extents), and exports print-ready DXF + PDF + PNG plus a per-device traceability CSV and verification MD/JSON. Returns the verification verdict, the auto device schedule, the device total, and downloadable URLs for all artifacts."
   },
   "servers": [
     { "url": "https://serverless.on-demand.io/apps/atrium-fp-pipeline" }
@@ -20,11 +20,19 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "required": ["base_file", "floor_sheet_id"],
+                "required": ["floor_sheet_id"],
                 "properties": {
                   "base_file": {
                     "type": "string",
-                    "description": "Public URL to the base architectural drawing. A direct-access .dxf is preferred; .dwg is converted in-container via LibreDWG when available."
+                    "description": "Public URL to the base architectural drawing — a native AutoCAD .dwg or a .dxf. DWG is converted in-container via LibreDWG (dwg2dxf). Provide either base_file (URL) or base_file_base64."
+                  },
+                  "base_file_base64": {
+                    "type": "string",
+                    "description": "Base64-encoded bytes of the base drawing (.dwg or .dxf), as an alternative to base_file. Set base_file_name to indicate the extension (defaults to .dxf)."
+                  },
+                  "base_file_name": {
+                    "type": "string",
+                    "description": "Filename hint for base_file_base64, e.g. 'A-111.dwg', used to pick the .dwg/.dxf ingest path. Default base.dxf."
                   },
                   "floor_sheet_id": {
                     "type": "string",
