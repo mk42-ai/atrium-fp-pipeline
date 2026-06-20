@@ -13,7 +13,7 @@
       "post": {
         "operationId": "runFireProtectionPipeline",
         "summary": "Generate an NFPA fire-protection overlay from a base architectural drawing",
-        "description": "Runs the 6-stage fire-protection pipeline (base ingest -> FP overlay -> device placement + traceability -> auto schedule -> 3-gate self-verification -> NFPA print export). Provide base_file as a public URL to a .dxf (preferred) or .dwg, plus a floor_sheet_id such as A-111. Returns the 3-gate verification result, the auto-aggregated device schedule, the total device count, and URLs to the seven output artifacts.",
+        "description": "Runs the 6-stage fire-protection pipeline (base ingest -> FP overlay -> device placement + traceability -> auto schedule -> 3-gate self-verification -> NFPA print export). Provide base_file as a public URL (or base64) to a native AutoCAD .dwg or a .dxf, plus a floor_sheet_id such as A-111. TWO PLACEMENT MODES: omit `devices` for AUTOMATIC placement (one sprinkler per room tag, plus standard detectors/valves/call-points and routing); or pass an explicit `devices` array to place EXACTLY the devices you specify at your own coordinates (agent-designed layout) — typically after calling /inspect to read the rooms. Either way the 3-gate self-verification validates the result. Returns the verification verdict, the auto-aggregated device schedule, the total device count, the placement_mode, and URLs to the output artifacts.",
         "requestBody": {
           "required": true,
           "content": {
@@ -71,6 +71,22 @@
                   "title_block": {
                     "type": "object",
                     "description": "Title-block field overrides: project_name, rfq, tenderer, revision."
+                  },
+                  "devices": {
+                    "type": "array",
+                    "description": "EXPLICIT agent-driven placement. When provided, the tool draws EXACTLY these devices at your coordinates instead of the automatic one-per-room-tag layout — so the agent designs the layout (e.g. fill each room on an NFPA spacing grid, clear of walls). Coordinates use the base drawing's units/coordinate system; call /inspect first to get room positions + extents. Sprinklers are auto-connected with cross-main + branch pipework. Omit this field for automatic placement.",
+                    "items": {
+                      "type": "object",
+                      "required": ["type", "x", "y"],
+                      "properties": {
+                        "type": { "type": "string", "enum": ["sprinkler", "smoke", "heat", "mcp", "sounder", "zcv", "landing_valve", "hose_reel", "riser"], "description": "Device type (aliases such as smoke_detector, manual_call_point, wet_riser are also accepted)" },
+                        "x": { "type": "number", "description": "X coordinate in drawing units, within the drawing extents" },
+                        "y": { "type": "number", "description": "Y coordinate in drawing units, within the drawing extents" },
+                        "tag": { "type": "string", "description": "Optional device tag; auto-numbered per type (e.g. SPK-01) if omitted" },
+                        "model": { "type": "string", "description": "Optional model/EMS label; sensible default per type" },
+                        "room": { "type": "string", "description": "Optional room/zone this device serves (recorded in the traceability CSV)" }
+                      }
+                    }
                   }
                 }
               }
@@ -89,6 +105,7 @@
                     "version": { "type": "string", "description": "Tool version" },
                     "sheet": { "type": "string", "description": "Floor sheet ID" },
                     "device_total": { "type": "integer", "description": "Total devices placed" },
+                    "placement_mode": { "type": "string", "description": "'auto' (room-tag algorithm) or 'explicit' (the devices you supplied)" },
                     "schedule": {
                       "type": "object",
                       "description": "Device counts per FP layer, auto-aggregated from block attributes"
@@ -182,6 +199,51 @@
             }
           },
           "404": { "description": "Artifact not found" }
+        }
+      }
+    },
+    "/inspect": {
+      "post": {
+        "operationId": "inspectDrawing",
+        "summary": "Inspect a base drawing — return its extents and room tags",
+        "description": "Ingests a base .dxf/.dwg (URL or base64) WITHOUT placing anything, and returns the drawing extents plus the room tags (name + x/y coordinates). Call this FIRST when you want agent-designed placement: read the rooms, reason about NFPA coverage, then build a `devices` list and call /run.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "base_file": { "type": "string", "description": "Public URL to the base .dxf or .dwg drawing" },
+                  "base_file_base64": { "type": "string", "description": "Base64 bytes of the drawing (alternative to base_file)" },
+                  "base_file_name": { "type": "string", "description": "Filename hint for base_file_base64 (e.g. A-111.dwg)" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Drawing geometry for designing a layout",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "extents": { "type": "object", "description": "Drawing bounds { min: [x,y,z], max: [x,y,z] }; every device placement must fall inside these" },
+                    "room_count": { "type": "integer", "description": "Number of room tags found" },
+                    "room_source": { "type": "string", "description": "Whether rooms came from the A-ANNO-ROOM layer or a fallback to all TEXT" },
+                    "rooms": {
+                      "type": "array",
+                      "description": "Room tags with positions — use these to design device coordinates",
+                      "items": { "type": "object", "properties": { "name": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" } } }
+                    },
+                    "base_layers": { "type": "array", "items": { "type": "string" }, "description": "Architectural base layer names" }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },

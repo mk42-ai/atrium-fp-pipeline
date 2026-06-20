@@ -241,6 +241,7 @@ def run():
             containment_tolerance_mm=body.get("containment_tolerance_mm"),
             output_formats=body.get("output_formats"),
             title_block=body.get("title_block"),
+            devices=body.get("devices"),
             workdir=workdir,
         )
     except Exception as e:  # noqa: BLE001
@@ -267,6 +268,83 @@ def run():
     result.pop("outputs", None)  # drop absolute container paths from the response
     result.pop("log", None)
     return jsonify(result)
+
+
+@app.post("/inspect")
+def inspect():
+    """Ingest a base drawing and report its extents + room tags so an agent can
+    DESIGN an explicit device layout before calling /run with `devices`."""
+    body = request.get_json(force=True, silent=True) or {}
+    base_file = body.get("base_file")
+    base_b64 = body.get("base_file_base64")
+    if not (base_file or base_b64):
+        return jsonify({"error": "base_file (URL) or base_file_base64 is required"}), 400
+    workdir = os.path.join(OUT_ROOT, "_inspect")
+    shutil.rmtree(workdir, ignore_errors=True)
+    os.makedirs(workdir, exist_ok=True)
+    try:
+        if base_b64:
+            b = (
+                base_b64.split(",", 1)[1]
+                if (base_b64.lstrip().startswith("data:") and "," in base_b64)
+                else base_b64
+            )
+            local = os.path.join(workdir, _safe_basename(body.get("base_file_name") or "base.dxf"))
+            with open(local, "wb") as f:
+                f.write(base64.b64decode(b))
+        elif isinstance(base_file, str) and base_file.lower().startswith(("http://", "https://")):
+            local = _download(base_file, workdir)
+        else:
+            local = base_file
+        local, ingest_note = _prepare_base(local, workdir)
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"could not read base_file: {e}"}), 400
+    try:
+        import ezdxf
+
+        doc = ezdxf.readfile(local)
+        msp = doc.modelspace()
+        extmin = doc.header.get("$EXTMIN", (0, 0, 0))
+        extmax = doc.header.get("$EXTMAX", (1, 1, 0))
+
+        def _tags(layer):
+            out = []
+            for t in msp.query("TEXT"):
+                if layer is None or t.dxf.layer == layer:
+                    out.append(
+                        {
+                            "name": t.dxf.text.strip(),
+                            "x": round(float(t.dxf.insert[0]), 1),
+                            "y": round(float(t.dxf.insert[1]), 1),
+                        }
+                    )
+            return out
+
+        rooms = _tags("A-ANNO-ROOM")
+        room_source = "A-ANNO-ROOM"
+        if not rooms:
+            rooms = _tags(None)
+            room_source = "all TEXT (no A-ANNO-ROOM layer present)"
+        return jsonify(
+            {
+                "ingest": ingest_note,
+                "units": body.get("units") or "mm",
+                "extents": {
+                    "min": [round(float(v), 1) for v in extmin],
+                    "max": [round(float(v), 1) for v in extmax],
+                },
+                "room_count": len(rooms),
+                "room_source": room_source,
+                "rooms": rooms[:1000],
+                "base_layers": [
+                    l.dxf.name for l in doc.layers if not l.dxf.name.startswith("FP-")
+                ],
+                "hint": "Use these room coordinates + extents to design a `devices` list for POST /run "
+                "(same coordinate system / units). Every placement must fall within extents.",
+            }
+        )
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": "inspect failed", "details": str(e)}), 500
 
 
 @app.get("/artifact/<sheet>/<path:filename>")
