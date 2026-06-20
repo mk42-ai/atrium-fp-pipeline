@@ -125,6 +125,52 @@ def _sanitize_dxf_handles(path):
     return changed
 
 
+def _strip_sortentstables(path):
+    """Remove SORTENTSTABLE (draw-order) objects from the DXF. Real AutoCAD DWGs
+    carry these and LibreDWG's dwg2dxf emits them with broken handle pairing, which
+    makes ezdxf reject the whole file with 'Invalid sort handle code 331, expected 5'.
+    They are purely cosmetic draw-order hints (not geometry), so dropping them is safe.
+    Returns the number removed."""
+    try:
+        lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
+    except Exception:  # noqa: BLE001
+        return 0
+    out, i, n, removed = [], 0, len(lines), 0
+    while i < n:
+        if lines[i].strip() == "0" and i + 1 < n and lines[i + 1].strip() == "SORTENTSTABLE":
+            # i ("0") is a group-code line; walk forward in (code,value) pairs to the
+            # next object boundary (a "0" code line), which we keep.
+            j = i + 2
+            while j + 1 < n and lines[j].strip() != "0":
+                j += 2
+            i = j
+            removed += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    if removed:
+        open(path, "w", encoding="utf-8").write("\n".join(out))
+    return removed
+
+
+def _normalize_dxf(path):
+    """Guarantee the DXF is loadable by a plain ezdxf.readfile() downstream. If the
+    converter output still trips strict loading, fall back to ezdxf.recover (the
+    tolerant byte-level loader) and re-emit a clean DXF in place. Returns a note."""
+    import ezdxf
+
+    try:
+        ezdxf.readfile(path)
+        return "clean"
+    except Exception:  # noqa: BLE001
+        pass
+    from ezdxf import recover
+
+    doc, auditor = recover.readfile(path)
+    doc.saveas(path)  # re-emit a guaranteed-loadable DXF
+    return f"recovered via ezdxf.recover ({len(auditor.errors)} issues)"
+
+
 def _prepare_base(local_path, workdir):
     """Normalise the base drawing to a DXF the pipeline can always read.
 
@@ -149,10 +195,21 @@ def _prepare_base(local_path, workdir):
             tail = ((cp.stderr or "") + (cp.stdout or ""))[-300:]
             raise RuntimeError(f"dwg2dxf could not convert the DWG: {tail}")
         fixed = _sanitize_dxf_handles(raw)
-        return raw, f"converted DWG->DXF via LibreDWG (handles repaired: {fixed})"
+        sorts = _strip_sortentstables(raw)
+        norm = _normalize_dxf(raw)
+        return raw, (
+            f"converted DWG->DXF via LibreDWG (handles repaired: {fixed}, "
+            f"sortentstables removed: {sorts}, load: {norm})"
+        )
     if low.endswith(".dxf"):
         fixed = _sanitize_dxf_handles(local_path)
-        note = "ingested DXF directly" if not fixed else f"ingested DXF (handles repaired: {fixed})"
+        sorts = _strip_sortentstables(local_path)
+        norm = _normalize_dxf(local_path)
+        note = (
+            "ingested DXF directly"
+            if not (fixed or sorts or norm != "clean")
+            else f"ingested DXF (handles repaired: {fixed}, sortentstables removed: {sorts}, load: {norm})"
+        )
         return local_path, note
     return local_path, "ingested as-is"
 
