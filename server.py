@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+atrium-fp-pipeline — serverless HTTP wrapper (On Demand serverless app).
+
+Runs the self-contained fire_protection_pipeline IN-container (ezdxf 1.4.4 +
+matplotlib, headless Agg) and serves the generated artifacts over HTTP.
+
+Routes:
+  GET  /health                       -> service + engine status
+  POST /run                          -> run the 6-stage pipeline; returns the
+                                        3-gate verification verdict, device
+                                        schedule, and downloadable artifact URLs
+  GET  /artifact/<sheet>/<filename>  -> download a generated artifact
+                                        (DXF / PDF / PNG / CSV / MD / JSON)
+
+No API keys or credentials required — the pipeline is fully local.
+"""
+import os
+import shutil
+import traceback
+from urllib.parse import urlparse, unquote
+from urllib.request import urlopen, Request
+
+from flask import Flask, request, jsonify, send_file, abort
+
+from atrium_fp_pipeline import (
+    fire_protection_pipeline,
+    TOOL_ID,
+    TOOL_NAME,
+    TOOL_VERSION,
+)
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB request cap
+
+# Where pipeline runs write their artifacts (served back via /artifact).
+OUT_ROOT = os.environ.get("OUT_ROOT", "/tmp/atrium_out")
+# Public base used to build artifact URLs returned by /run.
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL", "https://serverless.on-demand.io/apps/atrium-fp-pipeline"
+).rstrip("/")
+
+CONTENT_TYPES = {
+    ".dxf": "application/dxf",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".csv": "text/csv",
+    ".md": "text/markdown",
+    ".json": "application/json",
+}
+# Formats that should download rather than render inline in a browser/agent.
+ATTACH_EXTS = {".dxf", ".csv"}
+
+
+def _safe_basename(url_or_name):
+    name = os.path.basename(urlparse(url_or_name).path) or "base"
+    name = unquote(name)
+    if not os.path.splitext(name)[1]:
+        name += ".dxf"  # pipeline ingest keys off the extension
+    return name
+
+
+def _download(url, dest_dir):
+    fname = _safe_basename(url)
+    dest = os.path.join(dest_dir, fname)
+    req = Request(url, headers={"User-Agent": f"{TOOL_ID}/{TOOL_VERSION}"})
+    with urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+        shutil.copyfileobj(r, f)
+    if os.path.getsize(dest) == 0:
+        raise ValueError("downloaded base_file is empty")
+    return dest
+
+
+@app.get("/health")
+def health():
+    import ezdxf
+    import matplotlib
+
+    return jsonify(
+        {
+            "status": "ok",
+            "tool": TOOL_ID,
+            "callable": TOOL_NAME,
+            "version": TOOL_VERSION,
+            "engine": {
+                "ezdxf": ezdxf.__version__,
+                "matplotlib": matplotlib.__version__,
+            },
+            "dwg2dxf": bool(shutil.which("dwg2dxf")),
+        }
+    )
+
+
+@app.post("/run")
+def run():
+    body = request.get_json(force=True, silent=True) or {}
+    base_file = body.get("base_file")
+    sheet = body.get("floor_sheet_id")
+    if not base_file or not sheet:
+        return (
+            jsonify({"error": "base_file and floor_sheet_id are required"}),
+            400,
+        )
+
+    sheet = str(sheet)
+    workdir = os.path.join(OUT_ROOT, sheet)
+    shutil.rmtree(workdir, ignore_errors=True)
+    os.makedirs(workdir, exist_ok=True)
+
+    # Resolve base_file: URL -> download into workdir; else treat as a local path.
+    try:
+        if isinstance(base_file, str) and base_file.lower().startswith(
+            ("http://", "https://")
+        ):
+            local_base = _download(base_file, workdir)
+        else:
+            local_base = base_file
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"error": f"could not fetch base_file: {e}"}), 400
+
+    try:
+        result = fire_protection_pipeline(
+            base_file=local_base,
+            floor_sheet_id=sheet,
+            nfpa_params=body.get("nfpa_params") or {},
+            ahj=body.get("ahj"),
+            units=body.get("units"),
+            scale=body.get("scale"),
+            containment_tolerance_mm=body.get("containment_tolerance_mm"),
+            output_formats=body.get("output_formats"),
+            title_block=body.get("title_block"),
+            workdir=workdir,
+        )
+    except Exception as e:  # noqa: BLE001
+        return (
+            jsonify(
+                {
+                    "error": "pipeline failed",
+                    "details": str(e),
+                    "trace": traceback.format_exc().splitlines()[-6:],
+                }
+            ),
+            500,
+        )
+
+    # Rewrite local artifact paths -> public, downloadable URLs.
+    artifacts = {}
+    for key, path in (result.get("outputs") or {}).items():
+        if path and os.path.isfile(path):
+            artifacts[key] = f"{PUBLIC_BASE_URL}/artifact/{sheet}/{os.path.basename(path)}"
+    result["artifacts"] = artifacts
+    result.pop("outputs", None)  # drop absolute container paths from the response
+    result.pop("log", None)
+    return jsonify(result)
+
+
+@app.get("/artifact/<sheet>/<path:filename>")
+def artifact(sheet, filename):
+    safe = os.path.normpath(filename)
+    if safe.startswith("..") or os.path.isabs(safe):
+        abort(400)
+    path = os.path.join(OUT_ROOT, sheet, safe)
+    if not os.path.isfile(path):
+        abort(404)
+    ext = os.path.splitext(path)[1].lower()
+    return send_file(
+        path,
+        mimetype=CONTENT_TYPES.get(ext, "application/octet-stream"),
+        as_attachment=ext in ATTACH_EXTS,
+        download_name=os.path.basename(path),
+    )
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "3000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)

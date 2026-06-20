@@ -1,0 +1,213 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "Atrium FP Pipeline API",
+    "version": "1.0.0",
+    "description": "Reusable Atrium Tower fire-protection CAD pipeline (ezdxf 1.4.4 + matplotlib). Given a base architectural drawing (DXF preferred, or DWG) by public URL and a floor sheet ID, it produces an architecture-preserving NFPA fire-protection overlay (devices, routing, coverage hatch, legend, auto schedule, title block), runs a 3-gate self-verification (G1 architecture untouched, G2 device-in-room containment, G3 within drawing extents), and exports print-ready DXF + PDF + PNG plus a per-device traceability CSV and verification MD/JSON. Returns the verification verdict, the auto device schedule, the device total, and downloadable URLs for all artifacts."
+  },
+  "servers": [
+    { "url": "https://serverless.on-demand.io/apps/atrium-fp-pipeline" }
+  ],
+  "paths": {
+    "/run": {
+      "post": {
+        "operationId": "runFireProtectionPipeline",
+        "summary": "Generate an NFPA fire-protection overlay from a base architectural drawing",
+        "description": "Runs the 6-stage fire-protection pipeline (base ingest -> FP overlay -> device placement + traceability -> auto schedule -> 3-gate self-verification -> NFPA print export). Provide base_file as a public URL to a .dxf (preferred) or .dwg, plus a floor_sheet_id such as A-111. Returns the 3-gate verification result, the auto-aggregated device schedule, the total device count, and URLs to the seven output artifacts.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["base_file", "floor_sheet_id"],
+                "properties": {
+                  "base_file": {
+                    "type": "string",
+                    "description": "Public URL to the base architectural drawing. A direct-access .dxf is preferred; .dwg is converted in-container via LibreDWG when available."
+                  },
+                  "floor_sheet_id": {
+                    "type": "string",
+                    "description": "Floor / sheet identifier, e.g. A-111. Names the outputs and the title block."
+                  },
+                  "nfpa_params": {
+                    "type": "object",
+                    "description": "Optional NFPA 13/14/72/170 rule overrides. Defaults: nfpa13 = Light hazard, density 4.1 mm/min, max area 20.9 m2, max spacing 4.6 m; nfpa14 = standpipe Class II, landing valve DN65, hose reel 30m DN25; nfpa72 = smoke spacing 9.1 m, heat 57 C, mcp travel 61 m; nfpa170 = fire-safety symbol set."
+                  },
+                  "ahj": {
+                    "type": "string",
+                    "description": "Authority Having Jurisdiction.",
+                    "default": "ADCD"
+                  },
+                  "units": {
+                    "type": "string",
+                    "description": "Drawing units.",
+                    "default": "mm"
+                  },
+                  "scale": {
+                    "type": "string",
+                    "description": "Plot scale annotation.",
+                    "default": "1:200 (at A1)"
+                  },
+                  "containment_tolerance_mm": {
+                    "type": "integer",
+                    "description": "Gate-2 nearest-room tolerance in mm.",
+                    "default": 8000
+                  },
+                  "output_formats": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["dxf", "pdf", "png"] },
+                    "description": "Subset of output formats to export.",
+                    "default": ["dxf", "pdf", "png"]
+                  },
+                  "title_block": {
+                    "type": "object",
+                    "description": "Title-block field overrides: project_name, rfq, tenderer, revision."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Pipeline complete — verification verdict, device schedule, and artifact URLs.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tool": { "type": "string", "description": "Tool ID (atrium-fp-pipeline)" },
+                    "version": { "type": "string", "description": "Tool version" },
+                    "sheet": { "type": "string", "description": "Floor sheet ID" },
+                    "device_total": { "type": "integer", "description": "Total devices placed" },
+                    "schedule": {
+                      "type": "object",
+                      "description": "Device counts per FP layer, auto-aggregated from block attributes"
+                    },
+                    "verification": {
+                      "type": "object",
+                      "description": "3-gate self-verification report",
+                      "properties": {
+                        "overall": { "type": "string", "description": "PASS or FAIL (PASS only if gates 1, 2 and 3 all pass)" },
+                        "gate1_arch_untouched": { "type": "boolean", "description": "Base layer set + entity total unchanged" },
+                        "gate2_containment": { "type": "boolean", "description": "Every device associates to a real room tag within tolerance" },
+                        "gate2_max_dist_mm": { "type": "number", "description": "Max nearest-room distance in mm" },
+                        "gate3_within_extents": { "type": "boolean", "description": "Every device inside drawing extents" },
+                        "device_total": { "type": "integer", "description": "Total devices" }
+                      }
+                    },
+                    "artifacts": {
+                      "type": "object",
+                      "description": "Downloadable URLs for the generated artifacts",
+                      "properties": {
+                        "dxf": { "type": "string", "description": "R2010 DXF: untouched base + FP overlay" },
+                        "pdf": { "type": "string", "description": "NFPA-colour print plan (PDF)" },
+                        "png": { "type": "string", "description": "300-DPI PNG, >= 7000 px long edge" },
+                        "csv": { "type": "string", "description": "Per-device traceability CSV" },
+                        "verification_md": { "type": "string", "description": "3-gate verification report (Markdown)" },
+                        "verification_json": { "type": "string", "description": "3-gate verification report (JSON)" },
+                        "base_snapshot": { "type": "string", "description": "Base layers/entities/extents/room-tags snapshot (JSON)" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing or invalid input (base_file or floor_sheet_id absent, or base_file could not be fetched).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "error": { "type": "string", "description": "Error message" } }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Pipeline execution error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": { "type": "string", "description": "Error type" },
+                    "details": { "type": "string", "description": "Error details" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/artifact/{sheet}/{filename}": {
+      "get": {
+        "operationId": "getArtifact",
+        "summary": "Download a generated artifact",
+        "description": "Returns a single generated artifact (DXF / PDF / PNG / CSV / MD / JSON) for a given sheet. These URLs are returned by /run in the 'artifacts' object.",
+        "parameters": [
+          {
+            "name": "sheet",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Floor sheet ID used in the run (e.g. A-111)"
+          },
+          {
+            "name": "filename",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" },
+            "description": "Artifact filename, e.g. A-111_FireProtection_detailed.pdf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The artifact file.",
+            "content": {
+              "application/octet-stream": {
+                "schema": { "type": "string", "format": "binary" }
+              }
+            }
+          },
+          "404": { "description": "Artifact not found" }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "healthCheck",
+        "summary": "Service and engine health",
+        "description": "Returns service status, the engine versions (ezdxf, matplotlib), and whether dwg2dxf is available for DWG ingest.",
+        "responses": {
+          "200": {
+            "description": "Health status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "description": "Service status" },
+                    "version": { "type": "string", "description": "Tool version" },
+                    "engine": {
+                      "type": "object",
+                      "description": "Engine versions",
+                      "properties": {
+                        "ezdxf": { "type": "string" },
+                        "matplotlib": { "type": "string" }
+                      }
+                    },
+                    "dwg2dxf": { "type": "boolean", "description": "Whether LibreDWG dwg2dxf is available" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

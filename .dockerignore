@@ -1,0 +1,9 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+atrium_out/
+README.md
