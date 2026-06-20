@@ -91,26 +91,35 @@ def _libredwg_version():
 
 
 def _sanitize_dxf_handles(path):
-    """Reassign invalid '0' object-handles (a known LibreDWG dwg2dxf artifact) so
-    ezdxf can load the file. Returns the number of handles repaired."""
+    """Reassign any invalid object-handle (0, empty, or non-hex) — a known LibreDWG
+    dwg2dxf artifact that ezdxf rejects with 'Invalid handle 0' — to a fresh unique
+    handle so ezdxf can always load the file. Returns the number repaired."""
     try:
         lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
     except Exception:  # noqa: BLE001
         return 0
+    codes = ("5", "105")  # object-handle group codes
     existing = set()
     for i in range(len(lines) - 1):
-        if lines[i].strip() in ("5", "105"):
+        if lines[i].strip() in codes:
             try:
-                existing.add(int(lines[i + 1].strip(), 16))
+                v = int(lines[i + 1].strip(), 16)
+                if v > 0:
+                    existing.add(v)
             except ValueError:
                 pass
-    nxt = (max(existing) if existing else 0) + 1
+    nxt = (max(existing) + 1) if existing else 1
     changed = 0
     for i in range(len(lines) - 1):
-        if lines[i].strip() in ("5", "105") and lines[i + 1].strip() == "0":
-            lines[i + 1] = format(nxt, "X")
-            nxt += 1
-            changed += 1
+        if lines[i].strip() in codes:
+            try:
+                valid = int(lines[i + 1].strip(), 16) > 0
+            except ValueError:
+                valid = False
+            if not valid:
+                lines[i + 1] = format(nxt, "X")
+                nxt += 1
+                changed += 1
     if changed:
         open(path, "w", encoding="utf-8").write("\n".join(lines))
     return changed
@@ -240,6 +249,7 @@ def run():
                 {
                     "error": "pipeline failed",
                     "details": str(e),
+                    "ingest": ingest_note,
                     "trace": traceback.format_exc().splitlines()[-6:],
                 }
             ),
