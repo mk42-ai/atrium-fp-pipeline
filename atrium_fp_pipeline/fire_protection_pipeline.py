@@ -40,9 +40,71 @@ def _resolve_base_dxf(base_file, workdir):
     if os.path.exists(sib): return sib,"DWG converter unavailable; used sibling .dxf"
     raise FileNotFoundError(f"Cannot resolve a DXF for base {base_file}")
 
+def _pipe_size_mm(n):
+    """NFPA-style pipe schedule: nominal pipe Ø (mm) for n sprinklers carried downstream."""
+    for lim,s in ((1,25),(2,32),(3,40),(5,50),(10,65),(20,80),(40,100)):
+        if n<=lim: return s
+    return 150
+
+def _zone_layout(msp, place, zones, default_spacing_mm, HZ):
+    """Agent-defined zones -> NFPA coverage-grid sprinklers + routed branch/cross-main
+    pipework with per-segment pipe-size (Ø) labels. Returns (rows, sprk)."""
+    rows=[]; sprk=[]
+    def _lab(x,y,s):
+        t=msp.add_text("Ø%d"%s,dxfattribs={"layer":"FP-TEXT","height":160,"color":4}); t.set_placement((x,y))
+    def _frange(a,b,step):
+        out=[]; v=a
+        while v<=b+1e-6: out.append(v); v+=step
+        return out
+    def _inside(poly,px,py,bb):
+        if poly is None:
+            x0,y0,x1,y1=bb; return x0<=px<=x1 and y0<=py<=y1
+        c=False; n=len(poly); j=n-1
+        for i in range(n):
+            xi,yi=poly[i]; xj,yj=poly[j]
+            if ((yi>py)!=(yj>py)) and (px<(xj-xi)*(py-yi)/((yj-yi) or 1e-9)+xi): c=not c
+            j=i
+        return c
+    for zi,z in enumerate(zones,1):
+        zname=str(z.get("name") or ("Z%d"%zi))
+        if z.get("rect"):
+            x0,y0,x1,y1=[float(v) for v in z["rect"]]; poly=None
+        elif z.get("polygon") and len(z["polygon"])>=3:
+            poly=[(float(p[0]),float(p[1])) for p in z["polygon"]]
+            xs=[p[0] for p in poly]; ys=[p[1] for p in poly]; x0,y0,x1,y1=min(xs),min(ys),max(xs),max(ys)
+        else:
+            continue
+        bb=(x0,y0,x1,y1); S=float(z.get("spacing_mm") or default_spacing_mm); ins=S/2.0
+        gx=_frange(x0+ins,x1-ins,S) or [(x0+x1)/2.0]
+        gy=_frange(y0+ins,y1-ins,S) or [(y0+y1)/2.0]
+        feedx=x0+ins-S*0.6
+        row_heads={}; znum=0
+        for yy in gy:
+            rowpts=sorted(xx for xx in gx if _inside(poly,xx,yy,bb))
+            if not rowpts: continue
+            row_heads[yy]=len(rowpts)
+            for xx in rowpts:
+                znum+=1; tag="SPK-%s-%02d"%(zname[:6].upper(),znum)
+                place("FP_SPK",xx,yy,"FP-SPRINKLER-HEAD",tag,"ESFR K-25.2",HZ)
+                rows.append([tag,"ESFR K-25.2 sprinkler","%.1f"%xx,"%.1f"%yy,zname,HZ,"FP-SPRINKLER-HEAD"]); sprk.append((xx,yy))
+            pts=[feedx]+rowpts
+            msp.add_lwpolyline([(px,yy) for px in pts],dxfattribs={"layer":"FP-PIPE-BRANCH"})
+            for k in range(len(pts)-1):
+                _lab((pts[k]+pts[k+1])/2.0,yy+S*0.05,_pipe_size_mm(len(rowpts)-k))
+        if row_heads:
+            ys=sorted(row_heads)
+            msp.add_lwpolyline([(feedx,ry) for ry in ys],dxfattribs={"layer":"FP-PIPE-CROSSMAIN"})
+            cum=0
+            for idx in range(len(ys)-1,0,-1):
+                cum+=row_heads[ys[idx]]
+                _lab(feedx-S*0.3,(ys[idx]+ys[idx-1])/2.0,_pipe_size_mm(cum))
+            cum+=row_heads[ys[0]]
+            _lab(feedx-S*0.3,ys[0]-S*0.25,_pipe_size_mm(cum))
+    return rows, sprk
+
 def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj=None, units=None,
                              scale=None, containment_tolerance_mm=None, output_formats=None,
-                             title_block=None, workdir=None, devices=None):
+                             title_block=None, workdir=None, devices=None, zones=None):
     import ezdxf
     from ezdxf.enums import TextEntityAlignment
     ahj=ahj or DEFAULTS["ahj"]; units=units or DEFAULTS["units"]; scale=scale or DEFAULTS["scale"]
@@ -92,46 +154,53 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
 
     HZ=f"{nfpa['nfpa13']['hazard'].upper()}({nfpa['nfpa13']['density_mm_min']}mm/min)"
     rows=[]; sprk=[]
-    if devices:
-        # ---- Explicit, agent-driven placement: draw EXACTLY the supplied devices ----
-        PLACE_MAP=OrderedDict([
-            ("sprinkler",("FP_SPK","FP-SPRINKLER-HEAD","ESFR K-25.2","SPK","ESFR K-25.2 sprinkler")),
-            ("smoke",("FP_DET_S","FP-DET-SMOKE","Addr. Photoelectric","SD","Smoke detector")),
-            ("heat",("FP_DET_H","FP-DET-HEAT","Addr. Fixed/RoR 57C","HD","Heat detector")),
-            ("mcp",("FP_MCP","FP-MCP","Addressable MCP","MCP","Manual Call Point")),
-            ("sounder",("FP_SND","FP-SOUNDER","Addr. Sounder","SB","Sounder/Beacon")),
-            ("zcv",("FP_ZCV","FP-ZCV","BFV+FS+T&D","ZCV","Zone Control Valve")),
-            ("landing_valve",("FP_LV","FP-LANDINGVALVE","Landing Valve DN65","LV","Landing Valve")),
-            ("hose_reel",("FP_HR","FP-HOSEREEL","Hose Reel 30m DN25","HR","Hose Reel")),
-            ("riser",("FP_RISER","FP-RISER","Wet Riser DN150","WR","Wet Riser"))])
-        ALIAS={"sprinkler_head":"sprinkler","spk":"sprinkler","sprinklerhead":"sprinkler",
-               "smoke_detector":"smoke","smoke_det":"smoke","sd":"smoke","photoelectric":"smoke",
-               "heat_detector":"heat","heat_det":"heat","hd":"heat",
-               "manual_call_point":"mcp","callpoint":"mcp","call_point":"mcp",
-               "sounder_beacon":"sounder","beacon":"sounder","sb":"sounder",
-               "zone_control_valve":"zcv","zonecontrolvalve":"zcv",
-               "landingvalve":"landing_valve","lv":"landing_valve",
-               "hosereel":"hose_reel","hr":"hose_reel",
-               "wet_riser":"riser","wetriser":"riser","standpipe":"riser","wr":"riser"}
-        skipped=0
-        for dev in devices:
-            t=str(dev.get("type","")).strip().lower().replace("-","_").replace(" ","_"); t=ALIAS.get(t,t)
-            if t not in PLACE_MAP or "x" not in dev or "y" not in dev: skipped+=1; continue
-            blk,layer,defmodel,pfx,tname=PLACE_MAP[t]; x=float(dev["x"]); y=float(dev["y"])
-            tag=str(dev.get("tag") or f"{pfx}-{sum(1 for r in rows if r[6]==layer)+1:02d}")
-            place(blk,x,y,layer,tag,str(dev.get("model") or defmodel),HZ)
-            rows.append([tag,tname,f"{x:.1f}",f"{y:.1f}",str(dev.get("room") or "agent-placed"),HZ,layer])
-            if t=="sprinkler": sprk.append((x,y))
+    if zones or devices:
+        # ---- Agent-defined ZONES -> coverage-grid sprinklers + sized routed pipework ----
+        if zones:
+            zr,zs=_zone_layout(msp,place,zones,nfpa['nfpa13'].get('max_spacing_m',4.6)*1000.0,HZ)
+            rows+=zr; sprk+=zs
+        # ---- Explicit devices: extras (detectors, riser, ZCV, ...) the agent places exactly ----
+        if devices:
+            PLACE_MAP=OrderedDict([
+                ("sprinkler",("FP_SPK","FP-SPRINKLER-HEAD","ESFR K-25.2","SPK","ESFR K-25.2 sprinkler")),
+                ("smoke",("FP_DET_S","FP-DET-SMOKE","Addr. Photoelectric","SD","Smoke detector")),
+                ("heat",("FP_DET_H","FP-DET-HEAT","Addr. Fixed/RoR 57C","HD","Heat detector")),
+                ("mcp",("FP_MCP","FP-MCP","Addressable MCP","MCP","Manual Call Point")),
+                ("sounder",("FP_SND","FP-SOUNDER","Addr. Sounder","SB","Sounder/Beacon")),
+                ("zcv",("FP_ZCV","FP-ZCV","BFV+FS+T&D","ZCV","Zone Control Valve")),
+                ("landing_valve",("FP_LV","FP-LANDINGVALVE","Landing Valve DN65","LV","Landing Valve")),
+                ("hose_reel",("FP_HR","FP-HOSEREEL","Hose Reel 30m DN25","HR","Hose Reel")),
+                ("riser",("FP_RISER","FP-RISER","Wet Riser DN150","WR","Wet Riser"))])
+            ALIAS={"sprinkler_head":"sprinkler","spk":"sprinkler","sprinklerhead":"sprinkler",
+                   "smoke_detector":"smoke","smoke_det":"smoke","sd":"smoke","photoelectric":"smoke",
+                   "heat_detector":"heat","heat_det":"heat","hd":"heat",
+                   "manual_call_point":"mcp","callpoint":"mcp","call_point":"mcp",
+                   "sounder_beacon":"sounder","beacon":"sounder","sb":"sounder",
+                   "zone_control_valve":"zcv","zonecontrolvalve":"zcv",
+                   "landingvalve":"landing_valve","lv":"landing_valve",
+                   "hosereel":"hose_reel","hr":"hose_reel",
+                   "wet_riser":"riser","wetriser":"riser","standpipe":"riser","wr":"riser"}
+            for dev in devices:
+                t=str(dev.get("type","")).strip().lower().replace("-","_").replace(" ","_"); t=ALIAS.get(t,t)
+                if t not in PLACE_MAP or "x" not in dev or "y" not in dev: continue
+                blk,layer,defmodel,pfx,tname=PLACE_MAP[t]; x=float(dev["x"]); y=float(dev["y"])
+                tag=str(dev.get("tag") or f"{pfx}-{sum(1 for r in rows if r[6]==layer)+1:02d}")
+                place(blk,x,y,layer,tag,str(dev.get("model") or defmodel),HZ)
+                rows.append([tag,tname,f"{x:.1f}",f"{y:.1f}",str(dev.get("room") or "agent-placed"),HZ,layer])
+                if t=="sprinkler": sprk.append((x,y))
+        # Auto-wire explicit-only sprinklers (zones bring their own routing)
+        if devices and not zones and sprk:
+            cy0=sum(s[1] for s in sprk)/len(sprk); xmn=min(s[0] for s in sprk); xmx=max(s[0] for s in sprk)
+            msp.add_lwpolyline([(xmn-1000,cy0),(xmx+1000,cy0)],dxfattribs={"layer":"FP-PIPE-CROSSMAIN"})
+            for (x,y) in sprk: msp.add_lwpolyline([(x,y),(x,cy0)],dxfattribs={"layer":"FP-PIPE-BRANCH"})
         if sprk:
             cx=sum(s[0] for s in sprk)/len(sprk); cy=sum(s[1] for s in sprk)/len(sprk)
             xmin=min(s[0] for s in sprk); xmax=max(s[0] for s in sprk); ymin=min(s[1] for s in sprk); ymax=max(s[1] for s in sprk)
-            msp.add_lwpolyline([(xmin-1000,cy),(xmax+1000,cy)],dxfattribs={"layer":"FP-PIPE-CROSSMAIN"})
-            for (x,y) in sprk: msp.add_lwpolyline([(x,y),(x,cy)],dxfattribs={"layer":"FP-PIPE-BRANCH"})
         else:
             pts=[(float(r[2]),float(r[3])) for r in rows] or [(0.0,0.0)]
             cx=sum(p[0] for p in pts)/len(pts); cy=sum(p[1] for p in pts)/len(pts)
             xmin=min(p[0] for p in pts); xmax=max(p[0] for p in pts); ymin=min(p[1] for p in pts); ymax=max(p[1] for p in pts)
-        log.append((f"explicit placement: {len(rows)} devices ({skipped} skipped)",_utc()))
+        log.append((f"placement: {len(rows)} devices (zones={len(zones or [])}, explicit={len(devices or [])})",_utc()))
     else:
         for nm,x,y in room_tags:
             rid=nm[-2:] if len(nm)>=2 else nm
@@ -238,7 +307,7 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
     out["verification_json"]=os.path.join(workdir,f"{base_name}_verification.json")
     out["base_snapshot"]=os.path.join(workdir,f"{sid}_base_snapshot.json")
     return {"tool":TOOL_ID,"version":TOOL_VERSION,"sheet":sid,"snapshot":snapshot,"schedule":dict(agg),
-            "device_total":total_devices,"placement_mode":"explicit" if devices else "auto",
+            "device_total":total_devices,"placement_mode":"zoned" if zones else ("explicit" if devices else "auto"),
             "verification":verify,"outputs":out,"log":log}
 
 def _render(doc,msp,win,workdir,base_name,fmts,out):
@@ -283,12 +352,13 @@ def _main(argv):
     ap.add_argument("--scale",default=DEFAULTS["scale"]); ap.add_argument("--containment_tolerance_mm",type=int,default=DEFAULTS["containment_tolerance_mm"])
     ap.add_argument("--output_formats",default="dxf,pdf,png"); ap.add_argument("--nfpa_params",default="{}")
     ap.add_argument("--title_block",default="{}"); ap.add_argument("--workdir",default=os.getcwd())
-    ap.add_argument("--devices",default="")
+    ap.add_argument("--devices",default=""); ap.add_argument("--zones",default="")
     a=ap.parse_args(argv)
     res=fire_protection_pipeline(base_file=a.base_file,floor_sheet_id=a.floor_sheet_id,nfpa_params=json.loads(a.nfpa_params),
         ahj=a.ahj,units=a.units,scale=a.scale,containment_tolerance_mm=a.containment_tolerance_mm,
         output_formats=a.output_formats.split(","),title_block=json.loads(a.title_block),workdir=a.workdir,
-        devices=(json.loads(a.devices) if a.devices else None))
+        devices=(json.loads(a.devices) if a.devices else None),
+        zones=(json.loads(a.zones) if a.zones else None))
     print(json.dumps({k:res[k] for k in ("tool","version","sheet","device_total","schedule","verification","outputs")},indent=2,default=str))
 
 if __name__=="__main__": _main(sys.argv[1:])

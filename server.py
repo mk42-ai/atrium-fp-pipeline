@@ -242,6 +242,7 @@ def run():
             output_formats=body.get("output_formats"),
             title_block=body.get("title_block"),
             devices=body.get("devices"),
+            zones=body.get("zones"),
             workdir=workdir,
         )
     except Exception as e:  # noqa: BLE001
