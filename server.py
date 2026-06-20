@@ -243,6 +243,9 @@ def run():
             title_block=body.get("title_block"),
             devices=body.get("devices"),
             zones=body.get("zones"),
+            pipes=body.get("pipes"),
+            annotations=body.get("annotations"),
+            fittings=body.get("fittings"),
             workdir=workdir,
         )
     except Exception as e:  # noqa: BLE001
@@ -326,6 +329,25 @@ def inspect():
         if not rooms:
             rooms = _tags(None)
             room_source = "all TEXT (no A-ANNO-ROOM layer present)"
+        walls = []
+        if body.get("include_geometry"):
+            import re as _re
+
+            base_layer_names = [l.dxf.name for l in doc.layers if not l.dxf.name.startswith("FP-")]
+            wlayers = [n for n in base_layer_names if _re.search(r"WALL|PARTITION|COL|GLAZ|DOOR", n, _re.I)]
+            cnt = 0
+            for e in msp.query("LWPOLYLINE"):
+                if cnt >= 300:
+                    break
+                if wlayers and e.dxf.layer not in wlayers:
+                    continue
+                try:
+                    pts = [[round(float(p[0]), 1), round(float(p[1]), 1)] for p in e.get_points("xy")][:30]
+                except Exception:  # noqa: BLE001
+                    continue
+                if len(pts) >= 2:
+                    walls.append({"layer": e.dxf.layer, "points": pts})
+                    cnt += 1
         return jsonify(
             {
                 "ingest": ingest_note,
@@ -337,11 +359,15 @@ def inspect():
                 "room_count": len(rooms),
                 "room_source": room_source,
                 "rooms": rooms[:1000],
+                "wall_count": len(walls),
+                "walls": walls,
                 "base_layers": [
                     l.dxf.name for l in doc.layers if not l.dxf.name.startswith("FP-")
                 ],
-                "hint": "Use these room coordinates + extents to design a `devices` list for POST /run "
-                "(same coordinate system / units). Every placement must fall within extents.",
+                "hint": "You are the designer. Use the rooms + extents (and pass include_geometry:true to get "
+                "wall polylines to route around) to compose POST /run with: zones (coverage grids), devices "
+                "(riser/ZCV/valves/detectors), pipes (your routed sized paths), fittings, and annotations "
+                "(dimensions/levels/text). Same coordinate system / units; placements within extents.",
             }
         )
     except Exception as e:  # noqa: BLE001

@@ -103,9 +103,58 @@ def _zone_layout(msp, place, zones, default_spacing_mm, HZ):
             feeds.append((feedx,ys[0],total,zname))
     return rows, sprk, feeds
 
+def _draw_extras(msp, pipes, annotations, fittings):
+    """Agent-supplied drawing primitives: the AGENT works out the routes/dimensions/
+    fittings from the new plan (via /inspect) and the tool just renders them.
+      pipes:       [{"points":[[x,y],...], "size": 65, "kind": "branch|cross_main|riser"}]
+      annotations: [{"type":"text|dim|level", ...}]
+      fittings:    [{"type":"tee|elbow|bfv|flow_arrow|gate_valve|check_valve|test_drain", "x","y","angle"}]
+    """
+    KMAP={"branch":"FP-PIPE-BRANCH","cross_main":"FP-PIPE-CROSSMAIN","crossmain":"FP-PIPE-CROSSMAIN",
+          "main":"FP-PIPE-CROSSMAIN","riser":"FP-RISER","pipe":"FP-PIPE-BRANCH"}
+    def _t(s,x,y,h=200,color=1,rot=0):
+        e=msp.add_text(str(s),dxfattribs={"layer":"FP-TEXT","height":h,"color":color,"rotation":rot}); e.set_placement((x,y))
+    for p in (pipes or []):
+        pts=[(float(a[0]),float(a[1])) for a in p.get("points",[]) if len(a)>=2]
+        if len(pts)<2: continue
+        layer=KMAP.get(str(p.get("kind","branch")).lower().replace("-","_"),"FP-PIPE-BRANCH")
+        msp.add_lwpolyline(pts,dxfattribs={"layer":layer})
+        if p.get("size"):
+            mx,my=pts[len(pts)//2]; _t("Ø%s"%p["size"],mx,my+120,h=200,color=1)
+    for a in (annotations or []):
+        ty=str(a.get("type","text")).lower()
+        if ty in ("dim","dimension") and a.get("p1") and a.get("p2"):
+            x1,y1=float(a["p1"][0]),float(a["p1"][1]); x2,y2=float(a["p2"][0]),float(a["p2"][1])
+            msp.add_lwpolyline([(x1,y1),(x2,y2)],dxfattribs={"layer":"FP-DIM"})
+            for tx,tyy in ((x1,y1),(x2,y2)): msp.add_lwpolyline([(tx,tyy-120),(tx,tyy+120)],dxfattribs={"layer":"FP-DIM"})
+            _t(a.get("text") or "%d"%round(math.hypot(x2-x1,y2-y1)),(x1+x2)/2.0,(y1+y2)/2.0+120,h=float(a.get("height",220)),color=7)
+        elif ty=="level" and "x" in a and "y" in a:
+            x=float(a["x"]); y=float(a["y"])
+            if a.get("ffl") is not None: _t("+%s FFL"%a["ffl"],x,y,h=220,color=3)
+            if a.get("ssl") is not None: _t("+%s SSL"%a["ssl"],x,y-260,h=220,color=3)
+        elif "x" in a and "y" in a:
+            _t(a.get("text",""),float(a["x"]),float(a["y"]),h=float(a.get("height",250)),color=int(a.get("color",7)),rot=float(a.get("angle",0)))
+    for f in (fittings or []):
+        if "x" not in f or "y" not in f: continue
+        ty=str(f.get("type","tee")).lower().replace("-","_"); x=float(f["x"]); y=float(f["y"]); ang=math.radians(float(f.get("angle",0)))
+        if ty=="flow_arrow":
+            dx,dy=math.cos(ang),math.sin(ang); L=450
+            msp.add_lwpolyline([(x-dx*L,y-dy*L),(x+dx*L,y+dy*L)],dxfattribs={"layer":"FP-PIPE-BRANCH"})
+            msp.add_lwpolyline([(x+dx*L,y+dy*L),(x+dx*L-dx*180-dy*110,y+dy*L-dy*180+dx*110),
+                                (x+dx*L-dx*180+dy*110,y+dy*L-dy*180-dx*110),(x+dx*L,y+dy*L)],close=True,dxfattribs={"layer":"FP-PIPE-BRANCH"})
+        elif ty in ("bfv","gate_valve","check_valve","test_drain"):
+            msp.add_lwpolyline([(x-200,y-150),(x+200,y+150),(x+200,y-150),(x-200,y+150),(x-200,y-150)],dxfattribs={"layer":"FP-ZCV"})
+            lbl={"bfv":"BFV","gate_valve":"GV","check_valve":"CV","test_drain":"T&D"}[ty]
+            _t(lbl,x-180,y+230,h=140,color=5)
+        elif ty=="tee":
+            msp.add_circle((x,y),90,dxfattribs={"layer":"FP-PIPE-CROSSMAIN"})
+        elif ty=="elbow":
+            msp.add_circle((x,y),70,dxfattribs={"layer":"FP-PIPE-BRANCH"})
+
 def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj=None, units=None,
                              scale=None, containment_tolerance_mm=None, output_formats=None,
-                             title_block=None, workdir=None, devices=None, zones=None):
+                             title_block=None, workdir=None, devices=None, zones=None,
+                             pipes=None, annotations=None, fittings=None):
     import ezdxf
     from ezdxf.enums import TextEntityAlignment
     ahj=ahj or DEFAULTS["ahj"]; units=units or DEFAULTS["units"]; scale=scale or DEFAULTS["scale"]
@@ -267,6 +316,9 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
             rows.append([f"SB-{i:02d}","Sounder/Beacon",f"{mx+500:.1f}",f"{my:.1f}","exit/corridor",HZ,"FP-SOUNDER"])
         log.append((f"placed {len(rows)} devices",_utc()))
 
+    if pipes or annotations or fittings:
+        _draw_extras(msp,pipes,annotations,fittings)
+
     cover_r=nfpa['nfpa13'].get('max_spacing_m',4.6)*500.0; hatches=[]
     if not (zones or devices):  # filled coverage blobs clutter agent-designed / routed layouts
         for (x,y) in sprk:
@@ -389,12 +441,16 @@ def _main(argv):
     ap.add_argument("--output_formats",default="dxf,pdf,png"); ap.add_argument("--nfpa_params",default="{}")
     ap.add_argument("--title_block",default="{}"); ap.add_argument("--workdir",default=os.getcwd())
     ap.add_argument("--devices",default=""); ap.add_argument("--zones",default="")
+    ap.add_argument("--pipes",default=""); ap.add_argument("--annotations",default=""); ap.add_argument("--fittings",default="")
     a=ap.parse_args(argv)
     res=fire_protection_pipeline(base_file=a.base_file,floor_sheet_id=a.floor_sheet_id,nfpa_params=json.loads(a.nfpa_params),
         ahj=a.ahj,units=a.units,scale=a.scale,containment_tolerance_mm=a.containment_tolerance_mm,
         output_formats=a.output_formats.split(","),title_block=json.loads(a.title_block),workdir=a.workdir,
         devices=(json.loads(a.devices) if a.devices else None),
-        zones=(json.loads(a.zones) if a.zones else None))
+        zones=(json.loads(a.zones) if a.zones else None),
+        pipes=(json.loads(a.pipes) if a.pipes else None),
+        annotations=(json.loads(a.annotations) if a.annotations else None),
+        fittings=(json.loads(a.fittings) if a.fittings else None))
     print(json.dumps({k:res[k] for k in ("tool","version","sheet","device_total","schedule","verification","outputs")},indent=2,default=str))
 
 if __name__=="__main__": _main(sys.argv[1:])

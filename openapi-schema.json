@@ -100,6 +100,50 @@
                         "spacing_mm": { "type": "number", "description": "Sprinkler grid spacing in mm (default from NFPA hazard, ~4600 for Light)" }
                       }
                     }
+                  },
+                  "pipes": {
+                    "type": "array",
+                    "description": "YOUR routed pipework. You (the agent) work out each pipe path from the plan — e.g. routed around corridors/walls (call /inspect with include_geometry to get the walls) — and the tool just draws + labels it. The intelligence is yours; this is the drawing primitive.",
+                    "items": {
+                      "type": "object",
+                      "required": ["points"],
+                      "properties": {
+                        "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" } }, "description": "Ordered [[x,y], ...] vertices of the pipe run in drawing units (bend it around obstructions as needed)" },
+                        "size": { "type": "number", "description": "Nominal pipe Ø (mm) you sized for this run — labelled on the pipe (e.g. 25, 32, 65, 150)" },
+                        "kind": { "type": "string", "enum": ["branch", "cross_main", "riser"], "description": "Pipe role -> layer/colour (default branch)" }
+                      }
+                    }
+                  },
+                  "fittings": {
+                    "type": "array",
+                    "description": "Fittings / valves / flow arrows you place at points along your pipes.",
+                    "items": {
+                      "type": "object",
+                      "required": ["type", "x", "y"],
+                      "properties": {
+                        "type": { "type": "string", "enum": ["tee", "elbow", "bfv", "gate_valve", "check_valve", "test_drain", "flow_arrow"], "description": "Fitting type" },
+                        "x": { "type": "number" },
+                        "y": { "type": "number" },
+                        "angle": { "type": "number", "description": "Rotation in degrees (e.g. flow-arrow direction)" }
+                      }
+                    }
+                  },
+                  "annotations": {
+                    "type": "array",
+                    "description": "Dimensions, levels and free text you author — the annotation layer of the drawing.",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "type": { "type": "string", "enum": ["text", "dim", "level"], "description": "text (free note at x,y), dim (dimension line between p1 and p2), or level (FFL/SSL at x,y)" },
+                        "x": { "type": "number" },
+                        "y": { "type": "number" },
+                        "text": { "type": "string", "description": "Text to draw (for text; or override the auto distance for dim)" },
+                        "p1": { "type": "array", "items": { "type": "number" }, "description": "dim start [x,y]" },
+                        "p2": { "type": "array", "items": { "type": "number" }, "description": "dim end [x,y]" },
+                        "ffl": { "type": "number", "description": "Finished-floor level for type=level" },
+                        "ssl": { "type": "number", "description": "Structural-slab level for type=level" }
+                      }
+                    }
                   }
                 }
               }
@@ -229,7 +273,8 @@
                 "properties": {
                   "base_file": { "type": "string", "description": "Public URL to the base .dxf or .dwg drawing" },
                   "base_file_base64": { "type": "string", "description": "Base64 bytes of the drawing (alternative to base_file)" },
-                  "base_file_name": { "type": "string", "description": "Filename hint for base_file_base64 (e.g. A-111.dwg)" }
+                  "base_file_name": { "type": "string", "description": "Filename hint for base_file_base64 (e.g. A-111.dwg)" },
+                  "include_geometry": { "type": "boolean", "description": "If true, also return wall polylines so you can route pipes around them" }
                 }
               }
             }
@@ -251,6 +296,7 @@
                       "description": "Room tags with positions — use these to design device coordinates",
                       "items": { "type": "object", "properties": { "name": { "type": "string" }, "x": { "type": "number" }, "y": { "type": "number" } } }
                     },
+                    "walls": { "type": "array", "description": "Wall polylines (returned when include_geometry=true) — route your pipes around these", "items": { "type": "object", "properties": { "layer": { "type": "string" }, "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } } } } },
                     "base_layers": { "type": "array", "items": { "type": "string" }, "description": "Architectural base layer names" }
                   }
                 }
