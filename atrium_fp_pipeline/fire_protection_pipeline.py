@@ -162,7 +162,9 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
     output_formats=[f.lower() for f in (output_formats or DEFAULTS["output_formats"])]
     tb=dict(DEFAULTS["title_block"]); tb.update(title_block or {})
     nfpa=json.loads(json.dumps(DEFAULTS["nfpa_params"]))
-    if nfpa_params: nfpa.update(nfpa_params)
+    for _k,_v in (nfpa_params or {}).items():  # deep-merge: a partial nfpa13 keeps default keys (density_mm_min, ...)
+        if isinstance(_v,dict) and isinstance(nfpa.get(_k),dict): nfpa[_k].update(_v)
+        else: nfpa[_k]=_v
     workdir=workdir or os.getcwd(); sid=floor_sheet_id; log=[(f"start {sid}",_utc())]
     base_dxf,ingest_note=_resolve_base_dxf(base_file,workdir)
 
@@ -203,7 +205,8 @@ def fire_protection_pipeline(base_file, floor_sheet_id, nfpa_params=None, *, ahj
         r=msp.add_blockref(block,(x,y),dxfattribs={"layer":layer})
         r.add_auto_attribs({"TAG":tag,"MODEL":model,"X":f"{x:.1f}","Y":f"{y:.1f}","HAZARD":hz}); return r
 
-    HZ=f"{nfpa['nfpa13']['hazard'].upper()}({nfpa['nfpa13']['density_mm_min']}mm/min)"
+    _n13=nfpa.get('nfpa13',{}) if isinstance(nfpa.get('nfpa13'),dict) else {}
+    HZ=f"{str(_n13.get('hazard','Light')).upper()}({_n13.get('density_mm_min',4.1)}mm/min)"
     rows=[]; sprk=[]
     if zones or devices:
         # ---- Agent-defined ZONES -> coverage-grid sprinklers + sized routed pipework ----
